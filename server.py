@@ -1,5 +1,4 @@
 # server.py
-# Basit web formu (+ JSON API)
 # Yerel:  python -m uvicorn server:app --host 0.0.0.0 --port 8500 --reload
 # Render: gunicorn -w 1 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:$PORT server:app
 
@@ -14,17 +13,16 @@ from typing import List, Optional
 from importlib import import_module
 from string import Template
 
-# --------------------- Dosya yolları (mutlak) ---------------------
+# -------- Dosya yolları --------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 EXCEL_PATH = os.path.join(BASE_DIR, "Veri2024.xlsx")
 PRED_LOS_XLSX = os.path.join(BASE_DIR, "PRED_LOS.xlsx")
 
-# --------------------- Lazy model import (proje.py) ----------------
+# -------- Lazy model import --------
 _model = None
 _model_err: Optional[str] = None
 
 def _get_model():
-    """proje.py'yi ilk ihtiyaç olduğunda yükler; hata olursa _model_err set edilir."""
     global _model, _model_err
     if _model is not None:
         return _model
@@ -44,7 +42,7 @@ def _get_blend_w(default: float = 0.50) -> float:
     except Exception:
         return default
 
-# --------------------- Form seçenekleri (tek sefer) ----------------
+# -------- Form seçenekleri (tek sefer) --------
 YASGRUP_LIST: List[str] = []
 BOLUM_LIST: List[str]  = []
 ICD_LIST: List[str]    = []
@@ -90,7 +88,6 @@ def _derive_yasgrup_if_needed(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _load_options_once() -> None:
-    """Form seçim kutularını doldurur. EXCEL yoksa PRED_LOS.xlsx veya küçük defaultlarla devam eder."""
     global _OPTIONS_READY, YASGRUP_LIST, BOLUM_LIST, ICD_LIST
     if _OPTIONS_READY:
         return
@@ -132,7 +129,7 @@ def _load_options_once() -> None:
         ICD_LIST     = ["I10", "E11", "J18", "K35", "N39"]
         _OPTIONS_READY = True
 
-# ------------------------- HTML (string.Template) -------------------------
+# -------- HTML (string.Template) --------
 HTML_PAGE_TPL = Template(r"""
 <!doctype html>
 <html>
@@ -227,10 +224,9 @@ def _icd_key_from_inputs(icd_multi, icd_free_text: Optional[str]):
     key = "||".join(icds)
     return key, icds
 
-# ------------------------- FastAPI APP -------------------------
+# -------- FastAPI --------
 app = FastAPI(title="Yatış Günü Tahmin API (Formlu + JSON)")
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -239,12 +235,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Health-check
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-# HEAD / => 200 (Render health)
 @app.head("/")
 def root_head():
     return Response(status_code=200)
@@ -255,4 +249,101 @@ def form_get():
     warn = ""
     if not os.path.exists(EXCEL_PATH) and not os.path.exists(PRED_LOS_XLSX):
         warn = '<div class="warn">Uyarı: Veri dosyaları bulunamadı. Varsayılan seçeneklerle çalışıyor.</div>'
-    page = HTML_PAGE_T
+    page = HTML_PAGE_TPL.substitute(
+        yas_opts=_make_opts(YASGRUP_LIST),
+        bolum_opts=_make_opts(BOLUM_LIST),
+        icd_opts=_make_opts(ICD_LIST),
+        result_block="",
+        warn_block=warn,
+    )
+    return HTMLResponse(page)
+
+@app.post("/tahmin", response_class=HTMLResponse)
+async def tahmin_post(
+    yasgrup: str = Form(...),
+    bolum: str = Form(...),
+    icd_list: Optional[List[str]] = Form(default=None),
+    icd_free: Optional[str] = Form(default=None),
+):
+    _load_options_once()
+    try:
+        m = _get_model()
+    except Exception as e:
+        error_html = f'<div class="warn"><b>Hata:</b> {e}</div>'
+        page = HTML_PAGE_TPL.substitute(
+            yas_opts=_make_opts(YASGRUP_LIST, [yasgrup]),
+            bolum_opts=_make_opts(BOLUM_LIST, [bolum]),
+            icd_opts=_make_opts(ICD_LIST, []),
+            result_block=error_html,
+            warn_block="",
+        )
+        return HTMLResponse(page, status_code=500)
+
+    icd_key, icds = _icd_key_from_inputs(icd_list, icd_free)
+    icd_key = m.clean_icd_set_key(icd_key)
+
+    pred_rule, _meta = m.predict_one(yasgrup, bolum, icd_key)
+    _, _, p_ens = m.xgb_predict_ens(yasgrup, bolum, icd_key, icds)
+
+    if p_ens is not None and not (isinstance(p_ens, float) and (math.isnan(p_ens) or math.isinf(p_ens))):
+        w = _get_blend_w(0.50)
+        pred_final = (1.0 - w) * float(pred_rule) + w * float(p_ens)
+    else:
+        pred_final = float(pred_rule)
+
+    pred_final_rounded = m.round_half_up(pred_final)
+
+    result_html = f"""
+    <div class="result">
+      <div><b>Seçim</b>: YaşGrup=<code>{yasgrup}</code>, Bölüm=<code>{bolum}</code>, ICD=<code>{', '.join(icds) if icds else '(yok)'}</code></div>
+      <div style="margin-top:8px;"><b>Tahminî Yatış Günü (Pred_Final_Rounded)</b>: <span style="font-size:20px;">{pred_final_rounded}</span></div>
+    </div>
+    """
+
+    page = HTML_PAGE_TPL.substitute(
+        yas_opts=_make_opts(YASGRUP_LIST, [yasgrup]),
+        bolum_opts=_make_opts(BOLUM_LIST, [bolum]),
+        icd_opts=_make_opts(ICD_LIST, icds),
+        result_block=result_html,
+        warn_block="",
+    )
+    return HTMLResponse(page)
+
+@app.post("/api/predict")
+async def api_predict(payload: dict):
+    _load_options_once()
+    try:
+        m = _get_model()
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+    yasgrup = str(payload.get("yasgrup", "")).strip()
+    bolum   = str(payload.get("bolum", "")).strip()
+    icds_in = payload.get("icd", []) or []
+    if not isinstance(icds_in, list):
+        return JSONResponse({"error": "icd must be list"}, status_code=400)
+
+    icd_key = m.clean_icd_set_key("||".join(sorted(set([str(x).strip().upper() for x in icds_in if str(x).strip()]))))
+    pred_rule, _meta = m.predict_one(yasgrup, bolum, icd_key)
+    _, _, p_ens = m.xgb_predict_ens(yasgrup, bolum, icd_key, icds_in)
+
+    if p_ens is not None and not (isinstance(p_ens, float) and (math.isnan(p_ens) or math.isinf(p_ens))):
+        w = _get_blend_w(0.50)
+        pred_final = (1.0 - w) * float(pred_rule) + w * float(p_ens)
+    else:
+        pred_final = float(pred_rule)
+
+    return {
+        "yasgrup": yasgrup,
+        "bolum": bolum,
+        "icd": icds_in,
+        "pred_rule": float(pred_rule),
+        "pred_xgb_ens": (None if p_ens is None else float(p_ens)),
+        "pred_final": float(pred_final),
+        "pred_final_rounded": m.round_half_up(pred_final),
+    }
+
+@app.get("/api/options")
+def api_options():
+    _load_options_once()
+    return {"yasgrup": YASGRUP_LIST, "bolum": BOLUM_LIST, "icd": ICD_LIST}
