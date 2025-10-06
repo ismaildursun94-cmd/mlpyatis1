@@ -9,3 +9,4 @@ xgboost
 openpyxl
 joblib
 python-multipart
+xlsxwriter==3.2.0
