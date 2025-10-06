@@ -1,33 +1,45 @@
 # server.py
-# Basit web formu (+ JSON API) — dış kullanıcı linke girer, seçim yapar,
-# harman (Rule ∘ XGB_ENS) sonucu gelir.
+# Basit web formu (+ JSON API)
 # Yerel:  python -m uvicorn server:app --host 0.0.0.0 --port 8500 --reload
-# Render/Azure başlangıç komutu (örnek):
-# gunicorn -w 1 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:$PORT server:app
+# Render: gunicorn -w 1 -k uvicorn.workers.UvicornWorker -b 0.0.0.0:$PORT server:app
 
 from __future__ import annotations
 
 from fastapi import FastAPI, Form
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 import os, math
 from typing import List, Optional
 from importlib import import_module
 
-# ===================== LAZY MODEL IMPORT =====================
-# proje.py (eğitim + tahmin fonksiyonları) ağır olabilir; ilk isteğe ertele.
+# --------------------- Dosya yolları (kesin, mutlak) ---------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+EXCEL_PATH = os.path.join(BASE_DIR, "Veri2024.xlsx")   # eğitim ham veri (varsa formu doldurur)
+PRED_LOS_XLSX = os.path.join(BASE_DIR, "PRED_LOS.xlsx") # eğitim sonrası opsiyonel dosya
+
+# --------------------- Lazy model import (proje.py) -----------------------
 _model = None
+_model_err: Optional[str] = None
+
 def _get_model():
     """
-    proje.py'yi ilk ihtiyaç olduğunda yükler; sonraki çağrılar cache'ten gelir.
+    proje.py'yi ilk ihtiyaç olduğunda yükler; hata olursa _model_err set edilir.
     """
-    global _model
-    if _model is None:
-        _model = import_module("proje")
-    return _model
+    global _model, _model_err
+    if _model is not None:
+        return _model
+    if _model_err is not None:
+        raise RuntimeError(_model_err)
 
-# (Opsiyonel) eğitimdeki harman oranını kullan (yoksa 0.50)
+    try:
+        _model = import_module("proje")
+        return _model
+    except Exception as e:
+        # Burada import sırasında Excel okuma vs. patlarsa uygulama çökmesin.
+        _model_err = f"Model yüklenemedi: {e}"
+        raise RuntimeError(_model_err)
+
 def _get_blend_w(default: float = 0.50) -> float:
     try:
         m = _get_model()
@@ -35,14 +47,10 @@ def _get_blend_w(default: float = 0.50) -> float:
     except Exception:
         return default
 
-# --------------------- Seçenek veri kaynakları ---------------------
-EXCEL_PATH = "Veri2024.xlsx"     # eğitimde kullanılan ham veri (varsa buradan doldurur)
-PRED_LOS_XLSX = "PRED_LOS.xlsx"  # eğitim sonrası üretilmiş dosya (yedek)
-
-# Seçenek listeleri (server açılışında veya ilk ihtiyaçta doldurulur)
+# --------------------- Form seçenekleri (tek sefer) -----------------------
 YASGRUP_LIST: List[str] = []
-BOLUM_LIST: List[str] = []
-ICD_LIST: List[str] = []
+BOLUM_LIST: List[str]  = []
+ICD_LIST: List[str]    = []
 _OPTIONS_READY = False
 
 def _safe_unique(series: pd.Series) -> List[str]:
@@ -54,6 +62,7 @@ def _safe_unique(series: pd.Series) -> List[str]:
         .unique()
         .tolist()
     )
+    # kısa olanlar öne
     return sorted(set(vals), key=lambda x: (len(x), x))
 
 def _derive_yasgrup_if_needed(df: pd.DataFrame) -> pd.DataFrame:
@@ -116,21 +125,21 @@ def _load_options_once() -> None:
             df = pd.read_excel(PRED_LOS_XLSX)
             YASGRUP_LIST = _safe_unique(df.get("YaşGrup", pd.Series([], dtype=object)))
             BOLUM_LIST   = _safe_unique(df.get("Bölüm",   pd.Series([], dtype=object)))
-            # ICD’ler set key’den parçalanır
+            # ICD’ler set key’den
             icd = set()
             for s in df.get("ICD_Set_Key", pd.Series([], dtype=object)).dropna().astype(str):
                 for p in [x for x in s.split("||") if x]:
                     icd.add(p)
             ICD_LIST = sorted(icd)
         else:
-            # Default küçük listeler (sistem hiç bloklamasın diye)
+            # Default min set (uygulama bloklamasın)
             YASGRUP_LIST = ["15-25", "25-35", "35-50", "50-65", "65+"]
             BOLUM_LIST   = ["Dahiliye", "Kardiyoloji", "Genel Cerrahi"]
             ICD_LIST     = ["I10", "E11", "J18", "K35", "N39"]
 
         _OPTIONS_READY = True
     except Exception:
-        # Bir şey olursa yine defaultlarla devam et
+        # Hata olursa yine default
         YASGRUP_LIST = ["15-25", "25-35", "35-50", "50-65", "65+"]
         BOLUM_LIST   = ["Dahiliye", "Kardiyoloji", "Genel Cerrahi"]
         ICD_LIST     = ["I10", "E11", "J18", "K35", "N39"]
@@ -158,12 +167,16 @@ HTML_PAGE = """
     .icd-box { height: 180px; }
     .top-note { font-size:13px; color:#666; margin-top:6px; }
     code { background:#f3f3f5; padding:2px 6px; border-radius:6px; }
+    .warn { margin-top:12px; padding:10px; border-radius:10px; background:#fff5f5; border:1px solid #ffd5d5; color:#9a0000; }
   </style>
 </head>
 <body>
   <div class="card">
     <h1>Yatış Günü Tahmin</h1>
     <div class="top-note">Seçtiğiniz YaşGrup + Bölüm + ICD seti için <b>Harman (Rule ∘ XGB_ENS)</b> döner.</div>
+
+    {warn_block}
+
     <form method="post" action="/tahmin">
       <div class="row">
         <div>
@@ -235,23 +248,36 @@ app = FastAPI(title="Yatış Günü Tahmin API (Formlu + JSON)")
 # CORS (dış uygulamalar için)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # Güvenlik için domain kısıtlayabilirsin
+    allow_origins=["*"],   # Güvenlik için domain kısıtlanabilir
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ------------------------- Routes -------------------------
+# Health-check: Render HEAD / atar; açıkça 200 dön
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 @app.get("/", response_class=HTMLResponse)
 def form_get():
     _load_options_once()
+    warn = ""
+    if not os.path.exists(EXCEL_PATH) and not os.path.exists(PRED_LOS_XLSX):
+        warn = f'<div class="warn">Uyarı: Veri dosyaları bulunamadı. Varsayılan seçeneklerle çalışıyor.</div>'
     page = HTML_PAGE.format(
         yas_opts=_make_opts(YASGRUP_LIST),
         bolum_opts=_make_opts(BOLUM_LIST),
         icd_opts=_make_opts(ICD_LIST),
-        result_block=""
+        result_block="",
+        warn_block=warn
     )
     return HTMLResponse(page)
+
+# HEAD / => 200 (Render’ın sağlık kontrolü için)
+@app.head("/")
+def root_head():
+    return Response(status_code=200)
 
 @app.post("/tahmin", response_class=HTMLResponse)
 async def tahmin_post(
@@ -261,7 +287,20 @@ async def tahmin_post(
     icd_free: Optional[str] = Form(default=None),
 ):
     _load_options_once()
-    m = _get_model()
+
+    # Modeli getir
+    try:
+        m = _get_model()
+    except Exception as e:
+        error_html = f'<div class="warn"><b>Hata:</b> {e}</div>'
+        page = HTML_PAGE.format(
+            yas_opts=_make_opts(YASGRUP_LIST, [yasgrup]),
+            bolum_opts=_make_opts(BOLUM_LIST, [bolum]),
+            icd_opts=_make_opts(ICD_LIST, []),
+            result_block=error_html,
+            warn_block=""
+        )
+        return HTMLResponse(page, status_code=500)
 
     # ICD anahtarını hazırla
     icd_key, icds = _icd_key_from_inputs(icd_list, icd_free)
@@ -291,17 +330,22 @@ async def tahmin_post(
         yas_opts=_make_opts(YASGRUP_LIST, [yasgrup]),
         bolum_opts=_make_opts(BOLUM_LIST, [bolum]),
         icd_opts=_make_opts(ICD_LIST, icds),
-        result_block=result_html
+        result_block=result_html,
+        warn_block=""
     )
     return HTMLResponse(page)
 
 # ---- JSON API (Power BI, vb.) ----
-# POST body örn:
-# {"yasgrup":"35-50", "bolum":"Dahiliye", "icd": ["I10", "E11"]}
+# POST body örn: {"yasgrup":"35-50", "bolum":"Dahiliye", "icd": ["I10", "E11"]}
 @app.post("/api/predict")
 async def api_predict(payload: dict):
     _load_options_once()
-    m = _get_model()
+
+    # Model
+    try:
+        m = _get_model()
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
     yasgrup = str(payload.get("yasgrup", "")).strip()
     bolum   = str(payload.get("bolum", "")).strip()
@@ -329,12 +373,8 @@ async def api_predict(payload: dict):
         "pred_final_rounded": m.round_half_up(pred_final),
     }
 
-# ---- Yardımcı uçlar ----
+# Seçenekleri görmek için
 @app.get("/api/options")
 def api_options():
     _load_options_once()
     return {"yasgrup": YASGRUP_LIST, "bolum": BOLUM_LIST, "icd": ICD_LIST}
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
